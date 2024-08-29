@@ -77,22 +77,53 @@ fn get_color_schemes(dir: &PathBuf) -> Result<Vec<OsString>> {
         .collect::<Vec<OsString>>())
 }
 
-fn main() -> Result<()> {
-    let args = match parse_args() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {}.", e);
-            std::process::exit(1);
+enum Motion {
+    Up,
+    Down,
+}
+
+#[inline(always)]
+fn move_theme(
+    direction: Motion,
+    current_pos: isize,
+    options: &Vec<OsString>,
+) -> Result<(&str, isize)> {
+    let i = match direction {
+        Motion::Up => {
+            if current_pos >= options.len() as isize - 1 {
+                // move to beginning of list
+                0
+            } else {
+                current_pos + 1
+            }
+        }
+        Motion::Down => {
+            if current_pos <= 0 {
+                // move to the top of list
+                options.len() as isize - 1
+            } else {
+                current_pos - 1
+            }
         }
     };
 
+    let theme_file = options
+        .get(i as usize)
+        .expect("Must have an item at index")
+        .to_str()
+        .ok_or(anyhow!("Could not convert OSString to &str"))?;
+
+    Ok((theme_file, i))
+}
+
+fn main() -> Result<()> {
     let AppArgs {
         mut root_config,
         themes_dir,
         base_config_file,
         out_file,
         pick_file,
-    } = args;
+    } = parse_args()?;
 
     let mut themes_folder = root_config.clone();
     let mut out_file_path = root_config.clone();
@@ -102,14 +133,6 @@ fn main() -> Result<()> {
     themes_folder.push(themes_dir.clone());
     out_file_path.push(out_file);
     curr_theme_save_file.push("curr_theme");
-
-    // println!(
-    //     "root: {:?}, themes: {:?}, out_file: {:?}, curr_theme: {:?}",
-    //     &root_config.to_str(),
-    //     &themes_folder.to_str(),
-    //     &out_file_path.to_str(),
-    //     &curr_theme.to_str()
-    // );
 
     let mut stdout = stdout();
     let current_theme = read_current(&curr_theme_save_file);
@@ -149,7 +172,8 @@ fn main() -> Result<()> {
         )?;
         stdout.flush()?;
 
-        let mut themes = options.iter().cycle();
+        let mut i = 0isize;
+
         loop {
             let char = read()?;
 
@@ -165,7 +189,6 @@ fn main() -> Result<()> {
                             )?;
                             save_current(&curr_theme_save_file, &last_theme)?;
                         }
-                        // .ok_or(anyhow!("No new theme picked, no new theme saved"))?;
 
                         break;
                     }
@@ -184,12 +207,23 @@ fn main() -> Result<()> {
                             }
                             break;
                         }
+                        'p' => {
+                            let (theme_file, i_next) = move_theme(Motion::Down, i, &options)?;
+                            i = i_next;
+                            themes_folder.push(theme_file);
+                            last_viewed_theme = Some(theme_file);
+                            write_config(&root_config, &themes_folder, &out_file_path)?;
+                            themes_folder.pop();
+                            queue!(
+                                stdout,
+                                terminal::Clear(ClearType::CurrentLine),
+                                style::Print(theme_file),
+                                cursor::MoveToColumn(0)
+                            )?;
+                        }
                         'n' => {
-                            let theme_file = themes
-                                .next()
-                                .ok_or(anyhow!("Should never stop cycling through themes"))?
-                                .to_str()
-                                .ok_or(anyhow!("Could not get theme filename"))?;
+                            let (theme_file, i_next) = move_theme(Motion::Up, i, &options)?;
+                            i = i_next;
                             themes_folder.push(theme_file);
                             last_viewed_theme = Some(theme_file);
                             write_config(&root_config, &themes_folder, &out_file_path)?;
