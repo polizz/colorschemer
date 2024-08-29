@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossterm::terminal::ClearType;
 use std::ffi::OsString;
 use std::io::{stdout, Write};
@@ -18,6 +18,7 @@ OPTIONS:
   --themes              STRING       DEFAULT: ~/.config/alacritty/themes            Theme sub-directory under root config 
   --base-config         STRING       DEFAULT: ~/.config/alacritty/base.toml         Base Alacritty config without color information
   --out-file            STRING       DEFAULT: ~/.config/alacritty/alacritty.toml    Destination Alacritty config file to write 
+  --pick-file           STRING       OPTIONAL                                       Immediately select a theme file                                           
 ARGS:
   <INPUT>
 ";
@@ -28,6 +29,7 @@ struct AppArgs {
     themes_dir: PathBuf,
     base_config_file: String,
     out_file: String,
+    pick_file: Option<String>,
 }
 
 use crossterm::{
@@ -50,9 +52,12 @@ fn write_config(
     Ok(())
 }
 
-fn read_current(curr_file_path: &PathBuf) -> Result<String> {
-    let current_theme = std::fs::read_to_string(curr_file_path).unwrap_or("".to_owned());
-    Ok(current_theme)
+fn save_current(curr_theme_save_file: &PathBuf, curr_theme: &str) -> Result<()> {
+    std::fs::write(curr_theme_save_file, curr_theme).map_err(|e| e.into())
+}
+
+fn read_current(curr_file_path: &PathBuf) -> Option<String> {
+    std::fs::read_to_string(curr_file_path).ok()
 }
 
 fn get_color_schemes(dir: &PathBuf) -> Result<Vec<OsString>> {
@@ -60,14 +65,11 @@ fn get_color_schemes(dir: &PathBuf) -> Result<Vec<OsString>> {
 
     Ok(contents
         .filter_map(|en| {
-            if en.is_ok() {
-                let file = en.unwrap();
+            let en = en.ok()?;
+            let ft = en.file_type().ok()?;
 
-                if file.file_type().unwrap().is_file() {
-                    Some(file.file_name())
-                } else {
-                    None
-                }
+            if ft.is_file() {
+                Some(en.file_name())
             } else {
                 None
             }
@@ -89,16 +91,17 @@ fn main() -> Result<()> {
         themes_dir,
         base_config_file,
         out_file,
+        pick_file,
     } = args;
 
     let mut themes_folder = root_config.clone();
     let mut out_file_path = root_config.clone();
-    let mut curr_theme = root_config.clone();
+    let mut curr_theme_save_file = root_config.clone();
 
     root_config.push(base_config_file);
     themes_folder.push(themes_dir.clone());
     out_file_path.push(out_file);
-    curr_theme.push("curr_color");
+    curr_theme_save_file.push("curr_theme");
 
     // println!(
     //     "root: {:?}, themes: {:?}, out_file: {:?}, curr_theme: {:?}",
@@ -108,73 +111,105 @@ fn main() -> Result<()> {
     //     &curr_theme.to_str()
     // );
 
-    let current_theme = read_current(&curr_theme)?;
-    let mut options = get_color_schemes(&themes_folder)?;
-    options.sort();
-
-    terminal::enable_raw_mode()?;
     let mut stdout = stdout();
-    queue!(stdout, cursor::MoveToNextLine(1))?;
+    let current_theme = read_current(&curr_theme_save_file);
+    let mut last_viewed_theme: Option<&str> = None;
 
-    let current_theme_msg = format!("Current theme: {}", &current_theme);
-    queue!(
-        stdout,
-        style::Print(current_theme_msg),
-        cursor::MoveToNextLine(0),
-        style::Print("Press [n] to cycle themes, [q] to exit, [enter] to accept"),
-        cursor::MoveToNextLine(0),
-        style::Print("\r\n")
-    )?;
-    stdout.flush()?;
+    if let Some(picked_theme) = pick_file {
+        queue!(
+            stdout,
+            style::Print("Saving picked theme "),
+            style::Print(&picked_theme),
+            cursor::MoveToNextLine(1),
+        )?;
+        themes_folder.push(&picked_theme);
+        write_config(&root_config, &themes_folder, &out_file_path)?;
+        save_current(&curr_theme_save_file, &picked_theme)?;
 
-    let mut themes = options.iter().cycle();
-    loop {
-        let char = read()?;
+        stdout.flush()?;
+    } else {
+        let mut options = get_color_schemes(&themes_folder)?;
+        options.sort();
 
-        match char {
-            Event::Key(key_event) => match key_event.code {
-                KeyCode::Enter => {
-                    queue!(
-                        stdout,
-                        style::Print("Saving theme"),
-                        cursor::MoveToNextLine(1),
-                    )?;
+        terminal::enable_raw_mode()?;
+        queue!(stdout, cursor::MoveToNextLine(1))?;
 
-                    break;
-                }
-                KeyCode::Char(code) => match code {
-                    'q' => {
-                        let trimmed_theme = current_theme.trim();
-                        themes_folder.push(trimmed_theme);
-                        queue!(
-                            stdout,
-                            style::Print("Reverting to "),
-                            style::Print(trimmed_theme),
-                            cursor::MoveToNextLine(1),
-                        )?;
-                        write_config(&root_config, &themes_folder, &out_file_path)?;
+        let current_theme_msg = format!(
+            "Current theme: {:?}",
+            current_theme.as_ref().map_or("None", |c| c.trim())
+        );
+
+        queue!(
+            stdout,
+            style::Print(current_theme_msg),
+            cursor::MoveToNextLine(0),
+            style::Print("Press [n] to cycle themes, [q] to exit, [enter] to accept"),
+            cursor::MoveToNextLine(0),
+            style::Print("\r\n")
+        )?;
+        stdout.flush()?;
+
+        let mut themes = options.iter().cycle();
+        loop {
+            let char = read()?;
+
+            match char {
+                Event::Key(key_event) => match key_event.code {
+                    KeyCode::Enter => {
+                        if let Some(last_theme) = last_viewed_theme {
+                            queue!(
+                                stdout,
+                                style::Print("Saving theme "),
+                                style::Print(last_theme),
+                                cursor::MoveToNextLine(1),
+                            )?;
+                            save_current(&curr_theme_save_file, &last_theme)?;
+                        }
+                        // .ok_or(anyhow!("No new theme picked, no new theme saved"))?;
+
                         break;
                     }
-                    'n' => {
-                        let theme = themes.next().unwrap().to_str().unwrap();
-                        themes_folder.push(theme);
-                        write_config(&root_config, &themes_folder, &out_file_path)?;
-                        themes_folder.pop();
-                        queue!(
-                            stdout,
-                            terminal::Clear(ClearType::CurrentLine),
-                            style::Print(theme),
-                            cursor::MoveToColumn(0)
-                        )?;
-                    }
+                    KeyCode::Char(code) => match code {
+                        'q' => {
+                            if let Some(theme) = current_theme {
+                                let trimmed_theme = theme.trim();
+                                themes_folder.push(trimmed_theme);
+                                queue!(
+                                    stdout,
+                                    style::Print("Reverting to "),
+                                    style::Print(trimmed_theme),
+                                    cursor::MoveToNextLine(1),
+                                )?;
+                                write_config(&root_config, &themes_folder, &out_file_path)?;
+                            }
+                            break;
+                        }
+                        'n' => {
+                            let theme_file = themes
+                                .next()
+                                .ok_or(anyhow!("Should never stop cycling through themes"))?
+                                .to_str()
+                                .ok_or(anyhow!("Could not get theme filename"))?;
+                            themes_folder.push(theme_file);
+                            last_viewed_theme = Some(theme_file);
+                            write_config(&root_config, &themes_folder, &out_file_path)?;
+                            themes_folder.pop();
+                            queue!(
+                                stdout,
+                                terminal::Clear(ClearType::CurrentLine),
+                                style::Print(theme_file),
+                                cursor::MoveToColumn(0)
+                            )?;
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 },
                 _ => {}
-            },
-            _ => {}
-        }
+            }
 
-        stdout.flush()?;
+            stdout.flush()?;
+        }
     }
 
     terminal::disable_raw_mode()?;
@@ -201,6 +236,7 @@ fn parse_args() -> Result<AppArgs, pico_args::Error> {
         out_file: pargs
             .value_from_str("--out-file")
             .unwrap_or("alacritty.toml".into()),
+        pick_file: pargs.opt_value_from_str("--pick-file")?,
     };
 
     let remaining = pargs.finish();
